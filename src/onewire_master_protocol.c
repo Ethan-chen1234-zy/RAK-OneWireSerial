@@ -1,5 +1,9 @@
 #include "onewire_master_protocol.h"
 #include "onewire_master_api.h"
+#include "rak_ioc_types.h"
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
 #define REC_NUM 1
 #define BUFF_SIZE 0x100
@@ -25,8 +29,9 @@
 
 #define f_memset(P, V, L)                                                                                                        \
     do {                                                                                                                         \
-        for (U32 _i = 0; _i < L; _i++)                                                                                           \
-            P[_i] = V;                                                                                                           \
+        U8 *_p = (U8 *)(P);                                                                                                      \
+        for (U32 _i = 0; _i < (U32)(L); _i++)                                                                                    \
+            _p[_i] = (U8)(V);                                                                                                    \
     } while (0)
 #define f_memcmp(A, B, L) this_memcmp(A, B, L)
 #define f_memcpy(A, B, L) this_memcpy(A, B, L)
@@ -361,6 +366,39 @@ static RET_S32 this_memcpy(U8 *A, U8 *B, U16 len)
     return 0;
 }
 
+static U8 get_sdata_value_len(SNHub_Api_t *hub_api, U16 ofs, SNHub_Api_sData_Snsr_t *sData)
+{
+    U16 remaining;
+
+    if (hub_api->payload_length <= (ofs + sizeof(SNHub_Api_sData_Snsr_t))) {
+        return 0;
+    }
+
+    remaining = (U16)(hub_api->payload_length - ofs - sizeof(SNHub_Api_sData_Snsr_t));
+
+    if (sData->ipso == RAK_IPSO_MODBUS || sData->ipso == RAK_IPSO_SDI12) {
+        /* Two possible payload layouts exist in the field:
+         * A) [len][data...]
+         * B) rak_ioc_data_t: [id][type=0xF1/0xF2][datalen][data...]
+         */
+        if (remaining >= 3u && sData->value[1] == RAK_IPSO_MODBUS) {
+            U8 datalen = sData->value[2];
+            if ((U16)datalen + 3u <= remaining) {
+                return (U8)(datalen + 3u); // id + type + datalen + data
+            }
+            return (remaining > 255u) ? 255u : (U8)remaining;
+        }
+
+        U8 data_len = sData->value[0];
+        if ((U16)data_len + 1u <= remaining) {
+            return (U8)(data_len + 1u); // include the variable-length prefix byte
+        }
+        return (remaining > 255u) ? 255u : (U8)remaining;
+    }
+
+    return rakipso_tbl[sData->ipso].size;
+}
+
 /**
  * @brief Send request for Sensor data
  * 
@@ -372,18 +410,24 @@ static RET_S32 snhub_snsrdat_req_program(U8 *data, U16 len)
 {
     RUI3_Api_t *rui3_api = (RUI3_Api_t *)data;
     SNHub_Api_t *hub_api = (SNHub_Api_t *)(rui3_api->payload);
-    SNHub_Api_sData_Snsr_t *sData = (SNHub_Api_sData_Snsr_t *)(hub_api->payload);
-
     U16 ofs = 0;
-    do {
-        U8 pid = hub_api->source;
-        U8 sid = sData->sid;
-        U8 *val = &(sData->ipso);
-        U8 val_len = rakipso_tbl[sData->ipso].size;
-        on_evt(pid, sid, SNHUBAPI_EVT_REPORT, val, val_len + 1 /* add chksum byte */);
-        sData = (SNHub_Api_sData_Snsr_t *)&sData->value[val_len];
-        ofs += sizeof(SNHub_Api_sData_Snsr_t) + val_len;
-    } while (ofs < (hub_api->payload_length - 1 /* less N-1 bytes */));
+    U8 pid = hub_api->source;
+
+    /* Some probes may respond to SENDAT with short/ack-style payloads.
+     * Guard the parser strictly to avoid decoding garbage as IPSO[00].
+     */
+    while ((ofs + sizeof(SNHub_Api_sData_Snsr_t)) <= hub_api->payload_length) {
+        SNHub_Api_sData_Snsr_t *sData = (SNHub_Api_sData_Snsr_t *)&hub_api->payload[ofs];
+        U8 val_len = get_sdata_value_len(hub_api, ofs, sData);
+        U16 item_len = (U16)sizeof(SNHub_Api_sData_Snsr_t) + val_len;
+
+        if (val_len == 0 || (ofs + item_len) > hub_api->payload_length) {
+            break;
+        }
+
+        on_evt(pid, sData->sid, SNHUBAPI_EVT_REPORT, &(sData->ipso), val_len + 1 /* include ipso byte */);
+        ofs += item_len;
+    }
 
     return RET_OK;
 }
@@ -484,18 +528,22 @@ static RET_S32 snhub_snsrdat_rsp_program(U8 *data, U16 len)
 {
     RUI3_Api_t *rui3_api = (RUI3_Api_t *)data;
     SNHub_Api_t *hub_api = (SNHub_Api_t *)(rui3_api->payload);
-    SNHub_Api_sData_Snsr_t *sData = (SNHub_Api_sData_Snsr_t *)(hub_api->payload);
-
     U16 ofs = 0;
-    do {
-        U8 pid = hub_api->source;
-        U8 sid = sData->sid;
-        U8 *val = &(sData->ipso);
-        U8 val_len = rakipso_tbl[sData->ipso].size;
-        on_evt(pid, sid, SNHUBAPI_EVT_SDATA_REQ, val, val_len + 1 /* add chksum byte */);
-        sData = (SNHub_Api_sData_Snsr_t *)&sData->value[val_len];
-        ofs += sizeof(SNHub_Api_sData_Snsr_t) + val_len;
-    } while (ofs < (hub_api->payload_length - 1 /* less N-1 bytes */));
+    U8 pid = hub_api->source;
+
+    /* Robust parse for mixed firmware behavior (normal data frames + short ack frames). */
+    while ((ofs + sizeof(SNHub_Api_sData_Snsr_t)) <= hub_api->payload_length) {
+        SNHub_Api_sData_Snsr_t *sData = (SNHub_Api_sData_Snsr_t *)&hub_api->payload[ofs];
+        U8 val_len = get_sdata_value_len(hub_api, ofs, sData);
+        U16 item_len = (U16)sizeof(SNHub_Api_sData_Snsr_t) + val_len;
+
+        if (val_len == 0 || (ofs + item_len) > hub_api->payload_length) {
+            break;
+        }
+
+        on_evt(pid, sData->sid, SNHUBAPI_EVT_SDATA_REQ, &(sData->ipso), val_len + 1 /* include ipso byte */);
+        ofs += item_len;
+    }
 
     return RET_OK;
 }
@@ -521,6 +569,206 @@ static RET_S32 snhub_paramget_rsp_program(U8 *data, U16 len)
 
     on_evt(source, paramget->sid, SNHUBAPI_EVT_GET_ENABLE, (U8 *)&enable, sizeof(enable));
     return RET_OK;
+}
+
+/**
+ * @brief Forward IOC response payload to the application (funcode, iface, action, …).
+ */
+static RET_S32 snhub_ioc_rsp_program(U8 *data, U16 len)
+{
+    (void)len;
+    RUI3_Api_t *rui3_api = (RUI3_Api_t *)data;
+    SNHub_Api_t *hub_api = (SNHub_Api_t *)(rui3_api->payload);
+
+    // ProbeIO core-1.2.27+ uses:
+    // - hub_api->payload_type as IOC funcode (IO_CFG/IO_ADDPOLLEX/...)
+    // - hub_api->payload as rak_ioc_gen_frame_t: [iface][action][data...]
+    //
+    // For host convenience, forward a normalized buffer: [funcode][iface][action][data...]
+    // (this matches RakSNHub_IOC_ParseRsp() expectations).
+    do {
+        U8 out[224];
+        U16 out_len = 0;
+
+        if (hub_api->payload_length < 2) {
+            break;
+        }
+        if ((U32)hub_api->payload_length + 1u > sizeof(out)) {
+            break;
+        }
+
+        out[0] = hub_api->payload_type;
+        f_memcpy(&out[1], hub_api->payload, hub_api->payload_length);
+        out_len = (U16)(hub_api->payload_length + 1u);
+        on_evt(hub_api->source, 0, SNHUBAPI_EVT_IOC_RSP, out, out_len);
+    } while (0);
+    return RET_OK;
+}
+
+/**
+ * @brief Build and queue an IOC request (inner body = rak_ioc_gen_frame + data).
+ */
+static RET_S32 snhub_ioc_send_raw(U8 pid, U8 funcode, const U8 *ioc_body, U16 ioc_body_len)
+{
+    U8 pktBuff[BUFF_SIZE];
+    U16 pktLen = 0;
+    U16 pldLen = ioc_body_len;
+
+    if (pid == PID_MASTER) {
+        return RET_ERROR;
+    }
+    if ((U32)sizeof(SNHub_Api_t) + (U32)pldLen + sizeof(RUI3_Api_t) + 1 > BUFF_SIZE) {
+        return RET_ERROR;
+    }
+
+    RUI3_Api_t *rui3_api = (RUI3_Api_t *)pktBuff;
+    SNHub_Api_t *hub_api = (SNHub_Api_t *)(rui3_api->payload);
+
+    f_memset(pktBuff, 0, BUFF_SIZE);
+
+    rui3_api->wakeup = WAKEUPBYTE;
+    rui3_api->start = DELIMTER;
+    rui3_api->type = RUI3API_TYPE_SENSORHUB;
+    rui3_api->flag = RUI3API_FLG_REQ;
+    hub_api->source = PID_MASTER;
+    hub_api->dest = pid;
+    hub_api->sequence = ++menu.seq;
+    pktLen = sizeof(SNHub_Api_t);
+
+    hub_api->type = SNHUB_TYPE_IOC;
+    hub_api->payload_length = pldLen;
+    // core-1.2.27+: payload_type carries IOC funcode
+    hub_api->payload_type = funcode;
+    f_memcpy(hub_api->payload, (U8 *)ioc_body, pldLen);
+    pktLen += pldLen;
+
+    rui3_api->length.value = pktLen;
+    rui3_api->length.value = SHORT_SWAP(rui3_api->length.value);
+    rui3_api->payload[pktLen] = cal_chksum((U8 *)rui3_api, BUFF_SIZE);
+
+    pktLen += sizeof(RUI3_Api_t);
+    pktLen += 1;
+
+    on_evt(PID_MASTER, 0, SNHUBAPI_EVT_QSEND, pktBuff, pktLen);
+
+    return RET_OK;
+}
+
+static void api_ioc_send(U8 pid, U8 funcode, U8 iface, U8 action, const U8 *data, U16 data_len)
+{
+    U8 body[220];
+
+    if (pid == PID_MASTER) {
+        return;
+    }
+    // core-1.2.27+: IOC inner payload is [iface][action][data...]
+    if ((U32)data_len + 2u > sizeof(body)) {
+        return;
+    }
+    body[0] = iface;
+    body[1] = action;
+    if (data_len != 0 && data != NULL) {
+        f_memcpy(body + 2, (U8 *)data, data_len);
+    }
+    menu.result = SNHUB_RES_BUSY;
+    (void)snhub_ioc_send_raw(pid, funcode, body, (U16)(2 + data_len));
+}
+
+/**
+ * IOC command adapter for command_list[] compatibility.
+ * IOC requests with payload should use api_ioc_send()/RakSNHub_IOC_* helpers.
+ */
+static RET_S32 snhub_ioc_command(U8 pid, U8 sid, SNHUB_GS_E gset, U8 ptye)
+{
+    (void)pid;
+    (void)sid;
+    (void)gset;
+    (void)ptye;
+    return RET_ERROR;
+}
+
+static U8 is_hex_ascii(U8 ch)
+{
+    return ((ch >= (U8)'0' && ch <= (U8)'9') || (ch >= (U8)'a' && ch <= (U8)'f') || (ch >= (U8)'A' && ch <= (U8)'F'));
+}
+
+static RET_S32 validate_hex_cmd(const U8 *cmd, U16 cmd_len)
+{
+    U16 i;
+
+    if (cmd == NULL || cmd_len == 0 || (cmd_len & 1u) != 0) {
+        return RET_ERROR;
+    }
+
+    for (i = 0; i < cmd_len; i++) {
+        if (!is_hex_ascii(cmd[i])) {
+            return RET_ERROR;
+        }
+    }
+
+    return RET_OK;
+}
+
+static RET_S32 send_atcmd_raw(const U8 *cmd, U16 cmd_len)
+{
+    U8 pktBuff[BUFF_SIZE];
+    U16 pktLen = 0;
+
+    if (cmd == NULL || cmd_len == 0) {
+        return RET_ERROR;
+    }
+    if ((U32)sizeof(RUI3_Api_t) + cmd_len + 1 > BUFF_SIZE) {
+        return RET_ERROR;
+    }
+
+    RUI3_Api_t *rui3_api = (RUI3_Api_t *)pktBuff;
+    f_memset(pktBuff, 0, BUFF_SIZE);
+
+    rui3_api->wakeup = WAKEUPBYTE;
+    rui3_api->start = DELIMTER;
+    rui3_api->type = RUI3API_TYPE_ATCMD;
+    rui3_api->flag = RUI3API_FLG_REQ;
+    f_memcpy(rui3_api->payload, (U8 *)cmd, cmd_len);
+
+    pktLen = cmd_len;
+    rui3_api->length.value = pktLen;
+    rui3_api->length.value = SHORT_SWAP(rui3_api->length.value);
+    rui3_api->payload[pktLen] = cal_chksum((U8 *)rui3_api, BUFF_SIZE);
+
+    pktLen += sizeof(RUI3_Api_t);
+    pktLen += 1;
+
+    on_evt(PID_MASTER, 0, SNHUBAPI_EVT_QSEND, pktBuff, pktLen);
+    return RET_OK;
+}
+
+static void api_atcmd_send(const char *cmd)
+{
+    if (cmd == NULL) {
+        return;
+    }
+    (void)send_atcmd_raw((const U8 *)cmd, (U16)(strlen(cmd) + 1));
+}
+
+static RET_S32 send_atcmd_format(const char *fmt, ...)
+{
+    char cmd[220];
+    int len;
+    va_list args;
+
+    if (fmt == NULL) {
+        return RET_ERROR;
+    }
+
+    va_start(args, fmt);
+    len = vsnprintf(cmd, sizeof(cmd), fmt, args);
+    va_end(args);
+
+    if (len <= 0 || (U32)len >= sizeof(cmd)) {
+        return RET_ERROR;
+    }
+
+    return send_atcmd_raw((const U8 *)cmd, (U16)(len + 1));
 }
 
 /**
@@ -826,12 +1074,32 @@ static RET_S32 verify_rui3type(U8 *data, U16 len)
 
     switch (rui3_api->type) {
     case RUI3API_TYPE_SENSORHUB:
+    case RUI3API_TYPE_ATCMD:
         return RET_OK;
     case RUI3API_TYPE_ECHO:
-    case RUI3API_TYPE_ATCMD:
     default:
         break;
     }
+    return RET_ERROR;
+}
+
+static RET_S32 verify_atcmd_action(U8 *data, U16 len)
+{
+    (void)len;
+    RUI3_Api_t *rui3_api = (RUI3_Api_t *)data;
+    U16 payload_len = LSB_COMB(rui3_api->length.hbyte, rui3_api->length.lbyte);
+
+    if (rui3_api->flag == RUI3API_FLG_REQ) {
+        on_evt(PID_MASTER, 0, SNHUBAPI_EVT_RECV_REQ, data, len);
+        return RET_OK;
+    }
+
+    if (rui3_api->flag == RUI3API_FLG_RSP) {
+        on_evt(PID_MASTER, 0, SNHUBAPI_EVT_RECV_RSP, data, len);
+        on_evt(PID_MASTER, 0, SNHUBAPI_EVT_ATCMD_RSP, rui3_api->payload, payload_len);
+        return RET_OK;
+    }
+
     return RET_ERROR;
 }
 
@@ -915,12 +1183,12 @@ static void api_init(SNHub_Evt_t this_on_evt)
 static void api_process(U8 *msg, U16 len)
 {
     U16 dataLen = 0;
-    U16 dataOffset = 0;
+    RET_S32 dataOffset = 0;
     U8 *pdata = NULL;
 
     do {
         /* check default packet len */
-        if (len < (sizeof(RUI3_Api_t) + sizeof(SNHub_Api_t))) {
+        if (len < (sizeof(RUI3_Api_t) + 1 /* checksum */)) {
             break;
         }
 
@@ -932,7 +1200,7 @@ static void api_process(U8 *msg, U16 len)
 
         /* copy data to local buff */
         f_memset(dataBuff, 0, BUFF_SIZE);
-        f_memcpy(&dataBuff[1], &msg[dataOffset], (U8)len);
+        f_memcpy(&dataBuff[1], &msg[(U16)dataOffset], (U8)len);
 
         dataBuff[0] = WAKEUPBYTE;
         pdata = &dataBuff[0];
@@ -945,6 +1213,12 @@ static void api_process(U8 *msg, U16 len)
 
         /* verify rui3 api type, type have to eq RUI3API_TYPE_SENSORHUB */
         if (verify_rui3type(pdata, dataLen) != RET_OK) {
+            break;
+        }
+
+        RUI3_Api_t *rui3_api = (RUI3_Api_t *)pdata;
+        if (rui3_api->type == RUI3API_TYPE_ATCMD) {
+            (void)verify_atcmd_action(pdata, dataLen);
             break;
         }
 
@@ -973,7 +1247,7 @@ static const command_process command_list[] = {
     [SNHUB_TYPE_CONTROL] = NULL,  [SNHUB_TYPE_PARAMGET] = snhub_paramget_command,
     [SNHUB_TYPE_ALERT] = NULL,    [SNHUB_TYPE_ERR] = NULL,
     [SNHUB_TYPE_ACK] = NULL,      [SNHUB_TYPE_NACK] = NULL,
-    [SNHUB_TYPE_YMDM] = NULL,     [SNHUB_TYPE_IOC] = NULL,
+    [SNHUB_TYPE_YMDM] = NULL,     [SNHUB_TYPE_IOC] = snhub_ioc_command,
     [SNHUB_TYPE_MODBUS] = NULL,   [SNHUB_TYPE_SDI12] = NULL,
     [SNHUB_TYPE_ADC] = NULL,      [SNHUB_TYPE_DIO] = NULL,
 };
@@ -995,7 +1269,7 @@ static const protocol_process_t protocol_list[] = {
     [SNHUB_TYPE_ACK] = {.req = NULL, .rsp = NULL},
     [SNHUB_TYPE_NACK] = {.req = NULL, .rsp = NULL},
     [SNHUB_TYPE_YMDM] = {.req = NULL, .rsp = NULL},
-    [SNHUB_TYPE_IOC] = {.req = NULL, .rsp = NULL},
+    [SNHUB_TYPE_IOC] = {.req = NULL, .rsp = snhub_ioc_rsp_program},
     [SNHUB_TYPE_MODBUS] = {.req = NULL, .rsp = NULL},
     [SNHUB_TYPE_SDI12] = {.req = NULL, .rsp = NULL},
     [SNHUB_TYPE_ADC] = {.req = NULL, .rsp = NULL},
@@ -1073,5 +1347,231 @@ const RakSNHub_Protocl_API_t RakSNHub_Protocl_API = {
 
     .set.param = api_set_snsr_param,
 
+    .ioc.send = api_ioc_send,
+    .atcmd.send = api_atcmd_send,
+
     .reboot = api_set_provision,
 };
+
+RET_S32 RakSNHub_IOC_ParseRsp(const U8 *msg, U16 len, RakSNHub_IOC_Rsp_t *rsp)
+{
+    if (msg == NULL || rsp == NULL || len < 3) {
+        return RET_ERROR;
+    }
+
+    rsp->funcode = msg[0];
+    rsp->iface = msg[1];
+    rsp->action = msg[2];
+    rsp->data = (len > 3) ? (msg + 3) : NULL;
+    rsp->data_len = (len > 3) ? (U16)(len - 3) : 0;
+
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_ConfigRS485(U8 pid, U32 baudrate, U8 databit, U8 stopbit, U8 parity)
+{
+    rak_ioc_cfg_frame_t cfg;
+    U8 *cfg_raw = (U8 *)&cfg;
+    f_memset(cfg_raw, 0, sizeof(cfg));
+    cfg.cfg.baudrate = baudrate;
+    cfg.cfg.databit = databit;
+    cfg.cfg.stopbit = stopbit;
+    cfg.cfg.parity = parity;
+    api_ioc_send(pid, IO_CFG, IOC_RS485, IOA_REQ, (const U8 *)&cfg, sizeof(cfg));
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_AddPoll(U8 pid, U8 iface, U8 taskid, const U8 *cmd, U8 cmd_len, U32 period, U32 timeout, U8 retry)
+{
+    U8 payload[220];
+    U16 ofs = 0;
+
+    if (validate_hex_cmd(cmd, cmd_len) != RET_OK)
+        return RET_ERROR;
+    if ((U16)(sizeof(rak_ioc_addpoll_frame_t) + cmd_len) > sizeof(payload)) {
+        return RET_ERROR;
+    }
+
+    payload[ofs++] = taskid;
+    f_memcpy(&payload[ofs], (U8 *)&period, sizeof(period));
+    ofs += sizeof(period);
+    f_memcpy(&payload[ofs], (U8 *)&timeout, sizeof(timeout));
+    ofs += sizeof(timeout);
+    payload[ofs++] = retry;
+    f_memcpy(&payload[ofs], (U8 *)cmd, cmd_len);
+    ofs += cmd_len;
+
+    api_ioc_send(pid, IO_ADDPOLL, iface, IOA_REQ, payload, ofs);
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_AddPollHex(U8 pid, U8 iface, U8 taskid, const char *cmd_hex, U32 period, U32 timeout, U8 retry)
+{
+    U16 cmd_len;
+
+    if (cmd_hex == NULL) {
+        return RET_ERROR;
+    }
+
+    cmd_len = (U16)strlen(cmd_hex);
+    if (cmd_len > 255u) {
+        return RET_ERROR;
+    }
+
+    return RakSNHub_IOC_AddPoll(pid, iface, taskid, (const U8 *)cmd_hex, (U8)cmd_len, period, timeout, retry);
+}
+
+RET_S32 RakSNHub_IOC_AddPollEx(U8 pid, U8 iface, U8 taskid, const U8 *cmd, U8 cmd_len, U32 period, U32 timeout, U8 retry,
+                              U8 ipso, float scale, U8 datatype, const char *snsr_name)
+{
+    U8 payload[220];
+    U16 ofs = 0;
+
+    if (cmd == NULL || cmd_len == 0) {
+        return RET_ERROR;
+    }
+    if ((U16)(sizeof(rak_ioc_addpollex_frame_t) + cmd_len) > sizeof(payload)) {
+        return RET_ERROR;
+    }
+
+    payload[ofs++] = taskid;
+    f_memcpy(&payload[ofs], (U8 *)&period, sizeof(period));
+    ofs += sizeof(period);
+    f_memcpy(&payload[ofs], (U8 *)&timeout, sizeof(timeout));
+    ofs += sizeof(timeout);
+    payload[ofs++] = retry;
+
+    payload[ofs++] = ipso;
+    f_memcpy(&payload[ofs], (U8 *)&scale, sizeof(scale));
+    ofs += sizeof(scale);
+    payload[ofs++] = datatype;
+
+    // snsr_name is a fixed 16-byte field on ProbeIO (1.2.27+). It is not required to be zero-terminated.
+    {
+        U8 *namep = &payload[ofs];
+        f_memset(namep, 0, 16);
+        if (snsr_name != NULL && snsr_name[0] != '\0') {
+            // Avoid libc strlen() dependency: copy up to 16 bytes or until '\0'.
+            U8 n = 0;
+            while (n < 16u && snsr_name[n] != '\0') {
+                namep[n] = (U8)snsr_name[n];
+                n++;
+            }
+        }
+    }
+    ofs += 16;
+
+    f_memcpy(&payload[ofs], (U8 *)cmd, cmd_len);
+    ofs += cmd_len;
+
+    api_ioc_send(pid, IO_ADDPOLLEX, iface, IOA_REQ, payload, ofs);
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_EnablePoll(U8 pid, U8 iface, U8 taskid, U8 enable)
+{
+    rak_ioc_enablepoll_frame_t en;
+    en.taskid = taskid;
+    en.enable = enable;
+    api_ioc_send(pid, IO_ENABLEPOLL, iface, IOA_REQ, (const U8 *)&en, sizeof(en));
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_PollTask(U8 pid, U8 iface, U8 taskid)
+{
+    rak_ioc_polltask_frame_t poll;
+    poll.taskid = taskid;
+    api_ioc_send(pid, IO_POLLTASK, iface, IOA_REQ, (const U8 *)&poll, sizeof(poll));
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_PassThrough(U8 pid, U8 iface, const U8 *cmd, U8 cmd_len, U32 timeout)
+{
+    U8 payload[220];
+    U16 ofs = 0;
+
+    if (cmd == NULL || cmd_len == 0) {
+        return RET_ERROR;
+    }
+    if ((U16)(sizeof(rak_ioc_passthrh_frame_t) + cmd_len) > sizeof(payload)) {
+        return RET_ERROR;
+    }
+
+    f_memcpy(&payload[ofs], (U8 *)&timeout, sizeof(timeout));
+    ofs += sizeof(timeout);
+    f_memcpy(&payload[ofs], (U8 *)cmd, cmd_len);
+    ofs += cmd_len;
+
+    api_ioc_send(pid, IOPASSTHRH, iface, IOA_REQ, payload, ofs);
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_RmPollDef(U8 pid, U8 iface, U8 portid)
+{
+    rak_ioc_rmpdef_frame_t rmpdef;
+    f_memset(&rmpdef, 0, sizeof(rmpdef));
+    rmpdef.if_id = iface;
+    rmpdef.portid = portid;
+    api_ioc_send(pid, IO_RMPDEF, iface, IOA_REQ, (const U8 *)&rmpdef, sizeof(rmpdef));
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_ATCMD_Send(const char *cmd)
+{
+    if (cmd == NULL || cmd[0] == '\0') {
+        return RET_ERROR;
+    }
+    api_atcmd_send(cmd);
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_ATCMD_IOPsm(U8 pid, U8 mode, U8 enable, U32 wake_ms, U8 reserved, U8 save)
+{
+    return send_atcmd_format("ATC+IO_PSM=%u:%u:%u:%lu:%u:%u", (unsigned)pid, (unsigned)mode, (unsigned)enable,
+                             (unsigned long)wake_ms, (unsigned)reserved, (unsigned)save);
+}
+
+RET_S32 RakSNHub_ATCMD_ConfigRS485(U8 pid, U32 baudrate, U8 databit, U8 stopbit, U8 parity)
+{
+    return send_atcmd_format("ATC+IO_CFG=%u:RS485:%lu:%u:%u:%u", (unsigned)pid, (unsigned long)baudrate,
+                             (unsigned)databit, (unsigned)stopbit, (unsigned)parity);
+}
+
+RET_S32 RakSNHub_ATCMD_SensorConf(U8 pid, U8 sid, U32 interval, U8 count)
+{
+    return send_atcmd_format("ATC+SNSR_CONF=%u:%u:%lu:%u", (unsigned)pid, (unsigned)sid, (unsigned long)interval,
+                             (unsigned)count);
+}
+
+RET_S32 RakSNHub_ATCMD_IOAddPollMapped(U8 pid, const char *iface, U8 taskid, const char *cmd, U32 period, U32 timeout,
+                                       U8 retry, U8 data_len, const char *scale, U16 ipso, const char *profile)
+{
+    if (iface == NULL || cmd == NULL || cmd[0] == '\0' || scale == NULL || profile == NULL) {
+        return RET_ERROR;
+    }
+
+    return send_atcmd_format("ATC+IO_ADDPOLL=%u:%s:%u:%s:%lu:%lu:%u:%u:%s:%u:%s", (unsigned)pid, iface,
+                             (unsigned)taskid, cmd, (unsigned long)period, (unsigned long)timeout, (unsigned)retry,
+                             (unsigned)data_len, scale, (unsigned)ipso, profile);
+}
+
+RET_S32 RakSNHub_ATCMD_IOEnablePoll(U8 pid, const char *iface, U8 taskid, U8 enable)
+{
+    if (iface == NULL) {
+        return RET_ERROR;
+    }
+    return send_atcmd_format("ATC+IO_ENABLEPOLL=%u:%s:%u:%u", (unsigned)pid, iface, (unsigned)taskid, (unsigned)enable);
+}
+
+RET_S32 RakSNHub_ATCMD_IOPollTask(U8 pid, const char *iface, U8 taskid)
+{
+    if (iface == NULL) {
+        return RET_ERROR;
+    }
+    return send_atcmd_format("ATC+IO_POLLTASK=%u:%s:%u", (unsigned)pid, iface, (unsigned)taskid);
+}
+
+RET_S32 RakSNHub_ATCMD_ProbeDel(U8 pid)
+{
+    return send_atcmd_format("ATC+PRB_DEL=%u", (unsigned)pid);
+}

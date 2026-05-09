@@ -1,6 +1,8 @@
 #ifndef __onewire_master_api_h__
 #define __onewire_master_api_h__
 
+#define RAK_ONEWIRE_HAS_ATCMD_API 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -115,6 +117,10 @@ typedef enum {
     SNHUBAPI_EVT_QSEND,
     SNHUBAPI_EVT_REPORT,
     SNHUBAPI_EVT_SDATA_REQ,
+    /** IOC response: msg points to hub inner payload (funcode, iface, action, …). */
+    SNHUBAPI_EVT_IOC_RSP,
+    /** ATCMD response payload (ASCII bytes, not zero-terminated). */
+    SNHUBAPI_EVT_ATCMD_RSP,
     SNHUBAPI_EVT_MAX,
 } SNHUBAPI_EVT_E;
 
@@ -136,11 +142,55 @@ typedef struct {
         void (*param)(U8 pid, U8 sid, U8 enable, U32 intv);
     } set;
 
+    struct {
+        void (*send)(U8 pid, U8 funcode, U8 iface, U8 action, const U8 *data, U16 data_len);
+    } ioc;
+
+    struct {
+        /** Send one-wire ATCMD payload, e.g. "ATC+TSIN_DTYPE=GE!" */
+        void (*send)(const char *cmd);
+    } atcmd;
+
     void (*reboot)(void);
 
 } ATT_PACKED RakSNHub_Protocl_API_t;
 
 extern const RakSNHub_Protocl_API_t RakSNHub_Protocl_API;
+
+/**
+ * IOC typed helper APIs (MVP: IO_CFG / IO_ADDPOLL / IO_ENABLEPOLL).
+ */
+typedef struct {
+    U8 funcode;
+    U8 iface;
+    U8 action;
+    const U8 *data;
+    U16 data_len;
+} ATT_PACKED RakSNHub_IOC_Rsp_t;
+
+RET_S32 RakSNHub_IOC_ParseRsp(const U8 *msg, U16 len, RakSNHub_IOC_Rsp_t *rsp);
+RET_S32 RakSNHub_IOC_ConfigRS485(U8 pid, U32 baudrate, U8 databit, U8 stopbit, U8 parity);
+RET_S32 RakSNHub_IOC_AddPoll(U8 pid, U8 iface, U8 taskid, const U8 *cmd, U8 cmd_len, U32 period, U32 timeout, U8 retry);
+RET_S32 RakSNHub_IOC_AddPollHex(U8 pid, U8 iface, U8 taskid, const char *cmd_hex, U32 period, U32 timeout, U8 retry);
+RET_S32 RakSNHub_IOC_AddPollEx(U8 pid, U8 iface, U8 taskid, const U8 *cmd, U8 cmd_len, U32 period, U32 timeout, U8 retry,
+                              U8 ipso, float scale, U8 datatype, const char *snsr_name);
+RET_S32 RakSNHub_IOC_EnablePoll(U8 pid, U8 iface, U8 taskid, U8 enable);
+RET_S32 RakSNHub_IOC_PollTask(U8 pid, U8 iface, U8 taskid);
+RET_S32 RakSNHub_IOC_PassThrough(U8 pid, U8 iface, const U8 *cmd, U8 cmd_len, U32 timeout);
+RET_S32 RakSNHub_IOC_RmPollDef(U8 pid, U8 iface, U8 portid);
+
+/**
+ * Raw AT command helper (host-local ATCMD frame).
+ */
+RET_S32 RakSNHub_ATCMD_Send(const char *cmd);
+RET_S32 RakSNHub_ATCMD_IOPsm(U8 pid, U8 mode, U8 enable, U32 wake_ms, U8 reserved, U8 save);
+RET_S32 RakSNHub_ATCMD_ConfigRS485(U8 pid, U32 baudrate, U8 databit, U8 stopbit, U8 parity);
+RET_S32 RakSNHub_ATCMD_SensorConf(U8 pid, U8 sid, U32 interval, U8 count);
+RET_S32 RakSNHub_ATCMD_IOAddPollMapped(U8 pid, const char *iface, U8 taskid, const char *cmd, U32 period, U32 timeout,
+                                       U8 retry, U8 data_len, const char *scale, U16 ipso, const char *profile);
+RET_S32 RakSNHub_ATCMD_IOEnablePoll(U8 pid, const char *iface, U8 taskid, U8 enable);
+RET_S32 RakSNHub_ATCMD_IOPollTask(U8 pid, const char *iface, U8 taskid);
+RET_S32 RakSNHub_ATCMD_ProbeDel(U8 pid);
 
 #ifdef __cplusplus
 }

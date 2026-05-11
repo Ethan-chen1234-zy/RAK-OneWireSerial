@@ -17,6 +17,10 @@ extern "C" {
 #define U32 unsigned int
 #endif
 
+#ifndef S32
+#define S32 signed int
+#endif
+
 #ifndef ATT_PACKED
 #define ATT_PACKED __attribute__((packed))
 #endif
@@ -106,6 +110,38 @@ typedef struct {
     U8 value;
 } ATT_PACKED rak_ioc_data_frame_t;
 
+// core-1.2.27: com_if_rak_bank_decode_page_t is a 32-byte page stored in EEPROM BK3.
+// It is used by IO_DECODE for AIC/DI/DO mapping (IPSO/min/max/name/offset, etc.).
+typedef struct {
+    union {
+        U8 decode[32];
+        struct {
+            U8 IPSO;
+            S32 min;
+            S32 max;
+            U8 snsr_name[16];
+            float offset;
+        } aic;
+        struct {
+            U8 IPSO;
+            S32 trigger_mode;
+            S32 debounce;
+            U8 snsr_name[16];
+        } dig_o;
+        struct {
+            U8 IPSO;
+            S32 trigger_mode;
+            S32 debounce;
+            U8 snsr_name[16];
+        } dig_i;
+    } u;
+} ATT_PACKED com_if_rak_bank_decode_page_t;
+
+typedef struct {
+    U8 taskid;
+    com_if_rak_bank_decode_page_t param;
+} ATT_PACKED rak_ioc_decode_frame_t;
+
 typedef enum {
     IOPASSTHRH,
     IO_ADDPOLL,
@@ -125,14 +161,20 @@ typedef enum {
 } COM_TASK_RAK_IOC_FUNCCODE_L;
 
 typedef enum {
+    IOC_NO_IFACE = 0,
     IOC_RS485 = 1,
     IOC_SDI12,
     IOC_RS232,
+    IOC_CONTROL = 9,
     IOC_UART_END = 10,
-    IOC_MAMETER = 11,
-    IOC_VOLMETER,
-    IOC_DI,
-    IOC_DO,
+    IOC_AIC = 11, // analog input current (4-20mA)
+    IOC_AIV,      // analog input voltage
+    IOC_DI,       // digital input
+    IOC_DO,       // digital output
+
+    // Backward-compatible aliases (older naming in this library)
+    IOC_MAMETER = IOC_AIC,
+    IOC_VOLMETER = IOC_AIV,
 } COM_TASK_RAK_IOC_IFACE_L;
 
 typedef enum {

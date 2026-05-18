@@ -870,6 +870,58 @@ static RET_S32 snhub_provision_command(U8 pid, U8 sid, SNHUB_GS_E gset, U8 ptye)
 }
 
 /**
+ * @brief Send SensorHub CONTROL request (payload optional; reboot uses payload_length 0).
+ */
+static RET_S32 snhub_control_command(U8 pid, U8 control_payload_type, U16 payload_len, const U8 *payload)
+{
+    U8 pktBuff[BUFF_SIZE];
+    U16 pktLen = 0;
+
+    if (pid == PID_MASTER) {
+        return RET_ERROR;
+    }
+    if ((U32)sizeof(SNHub_Api_t) + (U32)payload_len + sizeof(RUI3_Api_t) + 1 > BUFF_SIZE) {
+        return RET_ERROR;
+    }
+    if (payload_len > 255u) {
+        return RET_ERROR;
+    }
+
+    RUI3_Api_t *rui3_api = (RUI3_Api_t *)pktBuff;
+    SNHub_Api_t *hub_api = (SNHub_Api_t *)(rui3_api->payload);
+
+    f_memset(pktBuff, 0, BUFF_SIZE);
+
+    rui3_api->wakeup = WAKEUPBYTE;
+    rui3_api->start = DELIMTER;
+    rui3_api->type = RUI3API_TYPE_SENSORHUB;
+    rui3_api->flag = RUI3API_FLG_REQ;
+    hub_api->source = PID_MASTER;
+    hub_api->dest = pid;
+    hub_api->sequence = ++menu.seq;
+    pktLen = sizeof(SNHub_Api_t);
+
+    hub_api->type = SNHUB_TYPE_CONTROL;
+    hub_api->payload_length = (U8)payload_len;
+    hub_api->payload_type = control_payload_type;
+    if (payload_len != 0 && payload != NULL) {
+        f_memcpy(hub_api->payload, (U8 *)payload, payload_len);
+        pktLen += payload_len;
+    }
+
+    rui3_api->length.value = pktLen;
+    rui3_api->length.value = SHORT_SWAP(rui3_api->length.value);
+    rui3_api->payload[pktLen] = cal_chksum((U8 *)rui3_api, BUFF_SIZE);
+
+    pktLen += sizeof(RUI3_Api_t);
+    pktLen += 1;
+
+    on_evt(PID_MASTER, 0, SNHUBAPI_EVT_QSEND, pktBuff, pktLen);
+
+    return RET_OK;
+}
+
+/**
  * @brief Send request for sensor data
  *
  * @param pid PID to be addressed
@@ -1259,6 +1311,20 @@ static void api_set_provision()
     CKTODO(command_list[SNHUB_TYPE_PROVISION])(PID_UNKNOW, 0, SNHUB_GS_SET, PLD_PROVI_TYPE_BOOT);
 }
 
+static void api_probe_reboot(U8 pid)
+{
+    if (pid == PID_MASTER) {
+        return;
+    }
+    menu.result = SNHUB_RES_BUSY;
+    (void)snhub_control_command(pid, RAK_SNHUB_CONTROL_REBOOT, 0, NULL);
+}
+
+void RakSNHub_ProbeReboot(U8 pid)
+{
+    api_probe_reboot(pid);
+}
+
 /** API functions */
 const RakSNHub_Protocl_API_t RakSNHub_Protocl_API = {
     .init = api_init,
@@ -1272,6 +1338,7 @@ const RakSNHub_Protocl_API_t RakSNHub_Protocl_API = {
     .ioc.send = api_ioc_send,
 
     .reboot = api_set_provision,
+    .probe_reboot = api_probe_reboot,
 };
 
 RET_S32 RakSNHub_IOC_ParseRsp(const U8 *msg, U16 len, RakSNHub_IOC_Rsp_t *rsp)
@@ -1291,6 +1358,11 @@ RET_S32 RakSNHub_IOC_ParseRsp(const U8 *msg, U16 len, RakSNHub_IOC_Rsp_t *rsp)
 
 RET_S32 RakSNHub_IOC_ConfigRS485(U8 pid, U32 baudrate, U8 databit, U8 stopbit, U8 parity)
 {
+    return RakSNHub_IOC_ConfigUart(pid, IOC_RS485, baudrate, databit, stopbit, parity);
+}
+
+RET_S32 RakSNHub_IOC_ConfigUart(U8 pid, U8 iface, U32 baudrate, U8 databit, U8 stopbit, U8 parity)
+{
     rak_ioc_cfg_frame_t cfg;
     U8 *cfg_raw = (U8 *)&cfg;
     f_memset(cfg_raw, 0, sizeof(cfg));
@@ -1298,7 +1370,7 @@ RET_S32 RakSNHub_IOC_ConfigRS485(U8 pid, U32 baudrate, U8 databit, U8 stopbit, U
     cfg.cfg.databit = databit;
     cfg.cfg.stopbit = stopbit;
     cfg.cfg.parity = parity;
-    api_ioc_send(pid, IO_CFG, IOC_RS485, IOA_REQ, (const U8 *)&cfg, sizeof(cfg));
+    api_ioc_send(pid, IO_CFG, iface, IOA_REQ, (const U8 *)&cfg, sizeof(cfg));
     return RET_OK;
 }
 
@@ -1448,6 +1520,73 @@ RET_S32 RakSNHub_IOC_DecodeAIC(U8 pid, U8 taskid, U8 ipso, S32 min, S32 max, flo
     }
 
     api_ioc_send(pid, IO_DECODE, IOC_AIC, IOA_REQ, (const U8 *)&dec, sizeof(dec));
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_DecodeAIV(U8 pid, U8 taskid, U8 ipso, S32 min, S32 max, float offset, const char *snsr_name)
+{
+    rak_ioc_decode_frame_t dec;
+    U8 *raw = (U8 *)&dec;
+    f_memset(raw, 0, sizeof(dec));
+
+    dec.taskid = taskid;
+    dec.param.u.aic.IPSO = ipso;
+    dec.param.u.aic.min = min;
+    dec.param.u.aic.max = max;
+    dec.param.u.aic.offset = offset;
+    if (snsr_name != NULL && snsr_name[0] != '\0') {
+        U8 n = 0;
+        while (n < 16u && snsr_name[n] != '\0') {
+            dec.param.u.aic.snsr_name[n] = (U8)snsr_name[n];
+            n++;
+        }
+    }
+
+    api_ioc_send(pid, IO_DECODE, IOC_AIV, IOA_REQ, (const U8 *)&dec, sizeof(dec));
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_DecodeDI(U8 pid, U8 taskid, U8 ipso, S32 trigger_mode, S32 debounce_ms, const char *snsr_name)
+{
+    rak_ioc_decode_frame_t dec;
+    U8 *raw = (U8 *)&dec;
+    f_memset(raw, 0, sizeof(dec));
+
+    dec.taskid = taskid;
+    dec.param.u.dig_i.IPSO = ipso;
+    dec.param.u.dig_i.trigger_mode = trigger_mode;
+    dec.param.u.dig_i.debounce = debounce_ms;
+    if (snsr_name != NULL && snsr_name[0] != '\0') {
+        U8 n = 0;
+        while (n < 16u && snsr_name[n] != '\0') {
+            dec.param.u.dig_i.snsr_name[n] = (U8)snsr_name[n];
+            n++;
+        }
+    }
+
+    api_ioc_send(pid, IO_DECODE, IOC_DI, IOA_REQ, (const U8 *)&dec, sizeof(dec));
+    return RET_OK;
+}
+
+RET_S32 RakSNHub_IOC_DecodeDO(U8 pid, U8 taskid, U8 ipso, S32 trigger_mode, S32 debounce_ms, const char *snsr_name)
+{
+    rak_ioc_decode_frame_t dec;
+    U8 *raw = (U8 *)&dec;
+    f_memset(raw, 0, sizeof(dec));
+
+    dec.taskid = taskid;
+    dec.param.u.dig_o.IPSO = ipso;
+    dec.param.u.dig_o.trigger_mode = trigger_mode;
+    dec.param.u.dig_o.debounce = debounce_ms;
+    if (snsr_name != NULL && snsr_name[0] != '\0') {
+        U8 n = 0;
+        while (n < 16u && snsr_name[n] != '\0') {
+            dec.param.u.dig_o.snsr_name[n] = (U8)snsr_name[n];
+            n++;
+        }
+    }
+
+    api_ioc_send(pid, IO_DECODE, IOC_DO, IOA_REQ, (const U8 *)&dec, sizeof(dec));
     return RET_OK;
 }
 

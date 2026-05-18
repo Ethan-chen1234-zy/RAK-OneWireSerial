@@ -144,9 +144,17 @@ typedef struct {
 
     void (*reboot)(void);
 
+    /** Remote ProbeIO reset: SensorHub CONTROL frame, payload_type = RAK_SNHUB_CONTROL_REBOOT (matches core RAK_PB_PAY_TYPE_CONTROL_REBOOT). */
+    void (*probe_reboot)(U8 pid);
+
 } ATT_PACKED RakSNHub_Protocl_API_t;
 
 extern const RakSNHub_Protocl_API_t RakSNHub_Protocl_API;
+
+/** Probe control payload types (inner probe frame payload_type); reboot is defined by ProbeIO core. */
+#define RAK_SNHUB_CONTROL_REBOOT 0x01
+
+void RakSNHub_ProbeReboot(U8 pid);
 
 /**
  * IOC typed helper APIs (MVP: IO_CFG / IO_ADDPOLL / IO_ENABLEPOLL).
@@ -161,6 +169,8 @@ typedef struct {
 
 RET_S32 RakSNHub_IOC_ParseRsp(const U8 *msg, U16 len, RakSNHub_IOC_Rsp_t *rsp);
 RET_S32 RakSNHub_IOC_ConfigRS485(U8 pid, U32 baudrate, U8 databit, U8 stopbit, U8 parity);
+/** IO_CFG for IOC_SDI12 / IOC_RS232 (same uart-shaped payload as RS485). */
+RET_S32 RakSNHub_IOC_ConfigUart(U8 pid, U8 iface, U32 baudrate, U8 databit, U8 stopbit, U8 parity);
 RET_S32 RakSNHub_IOC_AddPoll(U8 pid, U8 iface, U8 taskid, const U8 *cmd, U8 cmd_len, U32 period, U32 timeout, U8 retry);
 RET_S32 RakSNHub_IOC_AddPollHex(U8 pid, U8 iface, U8 taskid, const char *cmd_hex, U32 period, U32 timeout, U8 retry);
 RET_S32 RakSNHub_IOC_AddPollEx(U8 pid, U8 iface, U8 taskid, const U8 *cmd, U8 cmd_len, U32 period, U32 timeout, U8 retry,
@@ -169,6 +179,10 @@ RET_S32 RakSNHub_IOC_EnablePoll(U8 pid, U8 iface, U8 taskid, U8 enable);
 RET_S32 RakSNHub_IOC_PollTask(U8 pid, U8 iface, U8 taskid);
 RET_S32 RakSNHub_IOC_PassThrough(U8 pid, U8 iface, const U8 *cmd, U8 cmd_len, U32 timeout);
 RET_S32 RakSNHub_IOC_DecodeAIC(U8 pid, U8 taskid, U8 ipso, S32 min, S32 max, float offset, const char *snsr_name);
+/** Same payload layout as AIC; core routes by IOC_AIV (voltage / AIV decode pages). */
+RET_S32 RakSNHub_IOC_DecodeAIV(U8 pid, U8 taskid, U8 ipso, S32 min, S32 max, float offset, const char *snsr_name);
+RET_S32 RakSNHub_IOC_DecodeDI(U8 pid, U8 taskid, U8 ipso, S32 trigger_mode, S32 debounce_ms, const char *snsr_name);
+RET_S32 RakSNHub_IOC_DecodeDO(U8 pid, U8 taskid, U8 ipso, S32 trigger_mode, S32 debounce_ms, const char *snsr_name);
 RET_S32 RakSNHub_IOC_RmPollDef(U8 pid, U8 iface, U8 portid);
 
 #ifdef __cplusplus
